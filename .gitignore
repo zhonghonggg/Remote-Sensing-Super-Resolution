@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+release/
+wheelhouse/
+QA/
+publish-tools/
+github-publish/
+vendor/inno/
+vendor/innosetup.exe
+*.tif
+*.tiff
+*.log
+.env
+.env.*

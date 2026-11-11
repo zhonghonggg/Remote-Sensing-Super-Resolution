@@ -1,0 +1,12 @@
+Real-ESRGAN model and SRVGGNetCompact architecture: Xintao Wang et al.
+https://github.com/xinntao/Real-ESRGAN
+Official pretrained weights: realesr-general-x4v3.pth (v0.2.5.0)
+https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
+Repository BSD-3-Clause license is included verbatim. Upstream weights have no separate license statement; no additional rights or accuracy warranty are asserted here.
+Network: 32 body convolutions, 64 channels, PReLU, 4x PixelShuffle; dynamically exported ONNX N/H/W.
+
+This distribution embeds CPython, Tcl/Tk, NumPy, Rasterio/GDAL/PROJ and bundled geospatial libraries, pyproj, ONNX Runtime DirectML/DirectML.dll and their dependencies.
+Applicable license, copyright and third-party notice files collected from the installed distributions are under licenses/ and the embedded package directories.
+PyInstaller bootloader is distributed under its GPL exception for generated applications; see included license files.
+Installer generated with Inno Setup. The installer compiler is a build tool, not an application runtime dependency.
+The GeoSR map/magnifier icon was drawn for this project using geometric primitives, with no external image assets.
