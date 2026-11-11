@@ -1,7 +1,7 @@
 [Setup]
 AppId={{5A21D170-091A-47C2-A1C9-E3CC408B2BD1}
 AppName=GeoTIFF AI Super Resolution
-AppVersion=1.0.0
+AppVersion=1.1.0
 AppPublisher=GeoSR Project
 DefaultDirName={localappdata}\Programs\GeoSR
 DefaultGroupName=GeoTIFF AI Super Resolution
@@ -12,7 +12,7 @@ MinVersion=10.0
 DisableDirPage=no
 DisableProgramGroupPage=yes
 OutputDir=release
-OutputBaseFilename=GeoSR-1.0.0-Windows-x64-Setup
+OutputBaseFilename=GeoSR-1.1.0-Windows-x64-Setup
 SetupIconFile=assets\geosr.ico
 UninstallDisplayIcon={app}\GeoSR.exe
 Compression=lzma2

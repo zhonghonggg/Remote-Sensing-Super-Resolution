@@ -1,6 +1,8 @@
 from pathlib import Path
 import argparse, json, os, queue, sys, threading, traceback, webbrowser
 from engine import Config, Runner, Cancelled, resource
+from batch import run_inputs
+from updates import show_updates_once
 
 REPOSITORY_URL = 'https://github.com/zhonghonggg/Remote-Sensing-Super-Resolution'
 
@@ -8,7 +10,7 @@ def cli(args):
     p=argparse.ArgumentParser()
     p.add_argument('--input',required=True);p.add_argument('--output',required=True)
     p.add_argument('--resolution',type=float,default=.2);p.add_argument('--cpu',action='store_true')
-    p.add_argument('--report');p.add_argument('--tile',type=int,default=256);p.add_argument('--batch',type=int,default=4)
+    p.add_argument('--report');p.add_argument('--tile',type=int,default=256);p.add_argument('--batch',type=int,default=64)
     a=p.parse_args(args)
     events=[]
     def note(*e):
@@ -16,9 +18,10 @@ def cli(args):
         if sys.stdout:print(json.dumps(e,ensure_ascii=False),flush=True)
     report={}
     try:
-        result=Runner(Config(a.input,a.output,a.resolution,a.cpu,a.tile,a.batch),note).run()
-        report={'success':True,'output':str(result)}
-        return 0
+        result=run_inputs(Config(a.input,a.output,a.resolution,a.cpu,a.tile,a.batch),note)
+        report={'success':not result.failures and not result.cancelled,'outputs':result.outputs,'failures':result.failures,'total':result.total,'cancelled':result.cancelled}
+        if Path(a.input).is_file() and len(result.outputs)==1:report['output']=result.outputs[0]
+        return 0 if report['success'] else 1
     except Exception as exc:
         report={'success':False,'error':str(exc),'traceback':traceback.format_exc()}
         return 1
@@ -29,10 +32,10 @@ def gui():
     import tkinter as tk
     from tkinter import ttk,filedialog,messagebox
     from tkinter.scrolledtext import ScrolledText
-    root=tk.Tk();root.title('遥感影像超分辨率工具V1.0');root.geometry('850x670');root.minsize(720,560)
+    root=tk.Tk();root.title('遥感影像超分辨率工具V1.1');root.geometry('850x670');root.minsize(720,560)
     root.iconbitmap(str(resource('assets/geosr.ico')))
     root.columnconfigure(1,weight=1);root.rowconfigure(9,weight=1)
-    source=tk.StringVar();output=tk.StringVar();res=tk.StringVar(value='0.2');cpu=tk.BooleanVar()
+    source=tk.StringVar();output=tk.StringVar();res=tk.StringVar(value='0.2');cpu=tk.BooleanVar();batch=tk.StringVar(value='64')
     status=tk.StringVar(value='就绪');device=tk.StringVar(value='设备：自动 DirectML / CPU')
     q=queue.Queue();cancel=threading.Event();running=False;logs=[];result=None
     def browse_in():
@@ -41,6 +44,9 @@ def gui():
     def browse_out():
         f=filedialog.askdirectory()
         if f:output.set(f)
+    def browse_folder():
+        f=filedialog.askdirectory(title='选择原图文件夹（仅处理本层 .tif/.tiff）')
+        if f:source.set(f)
     ttk.Label(root,text='遥感影像超分辨率工具',font=('Microsoft YaHei UI',19,'bold')).grid(row=0,column=0,columnspan=3,sticky='w',padx=18,pady=(16,6))
     intro=ttk.Frame(root)
     intro.grid(row=1,column=0,columnspan=3,sticky='ew',padx=18,pady=6)
@@ -61,18 +67,25 @@ def gui():
     repository_link.bind('<Return>',open_repository)
     repository_link.bind('<space>',open_repository)
     fields=[]
-    for row,label,var,command in [(2,'原图 GeoTIFF',source,browse_in),(3,'成果保存目录',output,browse_out)]:
+    for row,label,var,command in [(2,'原图 / 文件夹',source,browse_in),(3,'成果保存目录',output,browse_out)]:
         ttk.Label(root,text=label).grid(row=row,column=0,sticky='w',padx=18,pady=6)
         e=ttk.Entry(root,textvariable=var);e.grid(row=row,column=1,sticky='ew',pady=6)
-        b=ttk.Button(root,text='浏览…',command=command);b.grid(row=row,column=2,padx=18);fields.extend([e,b])
+        chooser=ttk.Frame(root);chooser.grid(row=row,column=2,padx=18)
+        b=ttk.Button(chooser,text='选文件' if row==2 else '浏览…',command=command);b.pack(side='left');fields.extend([e,b])
+        if row==2:
+            b=ttk.Button(chooser,text='选文件夹',command=browse_folder);b.pack(side='left',padx=(4,0));fields.append(b)
     ttk.Label(root,text='目标像元（米）').grid(row=4,column=0,padx=18,sticky='w')
-    e=ttk.Entry(root,textvariable=res);e.grid(row=4,column=1,sticky='w');fields.append(e)
+    settings=ttk.Frame(root);settings.grid(row=4,column=1,sticky='w')
+    e=ttk.Entry(settings,textvariable=res,width=13);e.pack(side='left');fields.append(e)
+    ttk.Label(settings,text='  GPU 初始 batch').pack(side='left',padx=(10,4))
+    batch_input=ttk.Spinbox(settings,from_=1,to=128,textvariable=batch,width=6)
+    batch_input.pack(side='left');fields.append(batch_input)
     cb=ttk.Checkbutton(root,text='强制 CPU',variable=cpu);cb.grid(row=4,column=2);fields.append(cb)
     bar=ttk.Progressbar(root,maximum=100);bar.grid(row=5,column=0,columnspan=3,sticky='ew',padx=18,pady=(16,8))
-    ttk.Label(root,textvariable=status).grid(row=6,column=0,columnspan=2,sticky='w',padx=18)
+    ttk.Label(root,textvariable=status,wraplength=550).grid(row=6,column=0,columnspan=2,sticky='w',padx=18)
     ttk.Label(root,textvariable=device).grid(row=6,column=2,sticky='e',padx=18)
     buttons=ttk.Frame(root);buttons.grid(row=7,column=0,columnspan=3,sticky='w',padx=18,pady=10)
-    ttk.Label(root,text='支持 8/16 位灰度、RGB、RGBA；输出8位 RGB + Alpha。日志可另存。').grid(row=8,column=0,columnspan=3,sticky='w',padx=18)
+    ttk.Label(root,text='输出 GeoTIFF + 同名 .tif.ovr 金字塔；GPU 显存不足自动降低 batch，最终回退 CPU。').grid(row=8,column=0,columnspan=3,sticky='w',padx=18)
     log=ScrolledText(root,wrap='word',font=('Microsoft YaHei UI',10),state='disabled')
     log.grid(row=9,column=0,columnspan=3,sticky='nsew',padx=18,pady=12)
     def append(text):
@@ -82,21 +95,23 @@ def gui():
         # Bound GUI memory; user can save the retained recent 5000 messages.
         if len(logs)>5000:logs.pop(0);log.configure(state='normal');log.delete('1.0','2.0');log.configure(state='disabled')
     def worker(cfg):
-        try:q.put(('success',Runner(cfg,lambda *e:q.put(('event',e)),cancel).run()))
+        try:q.put(('success',run_inputs(cfg,lambda *e:q.put(('event',e)),cancel)))
         except Cancelled as exc:q.put(('cancel',str(exc)))
         except Exception:q.put(('error',traceback.format_exc()))
     def start():
         nonlocal running,result
         try:
             r=float(res.get())
-            if not Path(source.get()).is_file():raise ValueError('请选择有效的原图')
+            initial_batch=int(batch.get())
+            if not 1<=initial_batch<=128:raise ValueError('GPU 初始 batch 应为 1–128 的整数')
+            if not Path(source.get()).exists():raise ValueError('请选择有效的 GeoTIFF 文件或文件夹')
             if not output.get():raise ValueError('请选择成果目录')
             if not 0<r<float('inf'):raise ValueError('目标像元必须为有限正数')
         except Exception as exc:messagebox.showerror('输入错误',str(exc));return
         running=True;result=None;cancel.clear();bar['value']=0
         for w in fields+[start_button]:w.configure(state='disabled')
         cancel_button.configure(state='normal');status.set('准备中')
-        threading.Thread(target=worker,args=(Config(source.get(),output.get(),r,cpu.get()),),daemon=False).start()
+        threading.Thread(target=worker,args=(Config(source.get(),output.get(),r,cpu.get(),batch=initial_batch),),daemon=False).start()
     def stop():cancel.set();status.set('正在取消：等待当前推理 / 分块结束并清理');cancel_button.configure(state='disabled')
     def open_output():
         if output.get() and Path(output.get()).is_dir():os.startfile(output.get())
@@ -119,14 +134,24 @@ def gui():
                 running=False
                 for w in fields+[start_button]:w.configure(state='normal')
                 cancel_button.configure(state='disabled')
-                if kind=='success':result=data;status.set('完成 · 已校验并清理临时文件');append(f'成果：{data}');messagebox.showinfo('完成',f'已生成：\n{data}')
+                if kind=='success':
+                    result=data
+                    summary=f'共 {data.total} 幅，成功 {len(data.outputs)}，失败 {len(data.failures)}，未处理 {data.total-len(data.outputs)-len(data.failures)}'
+                    status.set(('已取消' if data.cancelled else '批次结束（含失败）' if data.failures else '完成 · 影像及金字塔已校验')+' · '+summary)
+                    append(summary)
+                    if data.cancelled:messagebox.showinfo('已取消',summary+'\n已完成成果保留，当前任务临时文件已清理。')
+                    elif data.failures:messagebox.showwarning('部分文件失败',summary+'\n失败原因详见日志。')
+                    elif len(data.outputs)==1:messagebox.showinfo('完成',f'已生成：\n{data.outputs[0]}\n{data.outputs[0]}.ovr')
+                    else:messagebox.showinfo('批量超分完成',summary+'\n每幅成果均含 GeoTIFF 和同名 .tif.ovr 金字塔。')
                 elif kind=='cancel':status.set('已取消 · 临时文件已清理');append(data)
                 else:status.set('失败 · 查看日志');append(data);messagebox.showerror('处理失败',data.splitlines()[-1])
         root.after(100,poll)
     def close():
         if running:stop();append('请等待任务取消和清理结束后关闭窗口')
         else:root.destroy()
-    root.protocol('WM_DELETE_WINDOW',close);poll();root.mainloop()
+    root.protocol('WM_DELETE_WINDOW',close);poll()
+    root.after(200,lambda:show_updates_once(lambda title,text:messagebox.showinfo(title,text,parent=root),append))
+    root.mainloop()
 
 if __name__=='__main__':
     if '--input' in sys.argv:sys.exit(cli(sys.argv[1:]))

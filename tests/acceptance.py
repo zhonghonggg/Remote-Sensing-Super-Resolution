@@ -23,7 +23,7 @@ def actual(cpu):
     assert events[-1][1]==100
     (T/('cpu-events.json' if cpu else 'gpu-events.json')).write_text(json.dumps(events,ensure_ascii=False,indent=2),encoding='utf-8')
     assert not list(p.parent.glob('.geosr-task-*'))
-test('实际 DirectML 推理与地理参考/Alpha',lambda:actual(False))
+if '--cpu-only' not in sys.argv:test('实际 DirectML 推理与地理参考/Alpha',lambda:actual(False))
 test('实际 CPU 推理与地理参考/Alpha',lambda:actual(True))
 class Fake:
     def __init__(self,device,state,mode):self.device=device;self.state=state;self.mode=mode

@@ -17,6 +17,7 @@ for cpu in [False,True]:
     data=json.loads(report.read_text(encoding='utf-8'));assert data['success'],data
     with rasterio.open(data['output']) as d:
         assert d.res==(.2,.2) and d.crs.to_epsg()==32650 and d.count==4
+        assert d.overviews(1) and Path(data['output']+'.ovr').is_file()
         for _,w in d.block_windows(1):d.read(window=w)
-    if not cpu:assert any(e[0]=='AI增强' and e[2]=='DirectML' for e in data['events'])
+    if not cpu:assert any(e[0].endswith('AI增强') and e[2]=='DirectML' for e in data['events'])
 print('Installed EXE CPU / GPU passed with Python and geospatial environment paths removed')

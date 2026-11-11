@@ -1,6 +1,6 @@
 """Bounded-memory GeoTIFF AI enhancement. No CUDA dependency."""
 from pathlib import Path
-import gc, math, os, shutil, tempfile, threading, uuid
+import gc, math, os, shutil, tempfile, threading, uuid, warnings
 from dataclasses import dataclass
 import numpy as np
 import rasterio
@@ -12,6 +12,7 @@ from rasterio.transform import from_origin
 from affine import Affine
 from pyproj import CRS
 import onnxruntime as ort
+from overviews import build_external
 
 class Cancelled(Exception): pass
 
@@ -22,7 +23,7 @@ class Config:
     resolution: float = .2
     cpu: bool = False
     tile: int = 256
-    batch: int = 4
+    batch: int = 64
     minimum_tile: int = 64
 
 def resource(name):
@@ -34,8 +35,9 @@ class Runner:
         self.cfg, self.notify = cfg, notify
         self.cancel = cancel or threading.Event()
         self.factory = factory
-        self.tile, self.batch = cfg.tile, cfg.batch
+        self.tile, self.batch = cfg.tile, 1 if cfg.cpu else cfg.batch
         self.device = 'CPU' if cfg.cpu else 'DirectML'
+        self.suggested_batch = self.batch
         self.session = None
         self.completed = 0
 
@@ -73,19 +75,35 @@ class Runner:
             reason = f'tile 降为 {self.tile}'
         elif self.device != 'CPU':
             self.device = 'CPU'
+            self.batch = 1
             reason = '自动切换 CPU，保留已完成分块'
         else:
             raise RuntimeError(f'CPU 最小分块仍失败：{error}') from error
         self.event('AI增强', self.ai_percent(), f'推理失败：{str(error)[:400]}；{reason}')
+        self.suggested_batch = self.batch
         try:
             self.session_init()
         except Exception as exc:
             if self.device == 'CPU': raise
             self.device = 'CPU'
+            self.batch = 1
             self.event('AI增强', self.ai_percent(), f'GPU 重建失败，自动 CPU：{exc}')
             self.session_init()
 
     def ai_percent(self): return 5 + 65 * self.completed / self.total
+
+    def memory_batch_limit(self, size):
+        import ctypes as C
+        class Memory(C.Structure):
+            _fields_=[('length',C.c_uint32),('load',C.c_uint32)]+[(n,C.c_uint64) for n in ('total','available','page_total','page_available','virtual_total','virtual_available','extended')]
+        mem=Memory();mem.length=C.sizeof(mem)
+        try:
+            ok=C.windll.kernel32.GlobalMemoryStatusEx(C.byref(mem))
+            budget=max(1,mem.available//3) if ok else 512*1024**2
+        except AttributeError:budget=512*1024**2
+        # Two input buffers + x4 output + mask/scratch allowance; independent of image area.
+        per_item=size*size*(3*4*18+8)
+        return max(1,int(budget//per_item))
 
     def infer_regions(self, src, dst, regions):
         """Small pending queue only; successful regions are never reprocessed."""
@@ -93,33 +111,36 @@ class Runner:
         while pending:
             self.check()
             # Repartition only unfinished rectangles after a tile reduction.
-            x,y,w,h = pending[0]
-            if w > self.tile or h > self.tile:
-                pending.pop(0)
-                pieces = [(xx, yy, min(self.tile,x+w-xx), min(self.tile,y+h-yy))
-                          for yy in range(y,y+h,self.tile) for xx in range(x,x+w,self.tile)]
-                pending[0:0] = pieces
-                continue
-            group = pending[:self.batch]
+            if any(w>self.tile or h>self.tile for x,y,w,h in pending):
+                pending=[(xx,yy,min(self.tile,x+w-xx),min(self.tile,y+h-yy))
+                         for x,y,w,h in pending for yy in range(y,y+h,self.tile) for xx in range(x,x+w,self.tile)]
             # Fixed square context makes all items in a batch stackable.
             pad = 40  # receptive radius 34, plus interpolation margin
             size = self.tile + 2*pad
+            memory_limit=self.memory_batch_limit(size)
+            if self.batch>memory_limit:self.suggested_batch=min(self.suggested_batch,memory_limit)
+            limit=min(len(pending),memory_limit)
+            if self.batch>limit:
+                self.batch=limit
+                self.event('AI增强',self.ai_percent(),f'按剩余分块数 / 可用系统内存设置实际 batch={self.batch}')
+            group = pending[:self.batch]
             arrays, masks = [], []
-            for x,y,w,h in group:
-                win = Window(x-pad,y-pad,size,size)
-                a = src.read(self.channels, window=win, boundless=True, fill_value=0)
-                m = np.min(src.read_masks(self.channels,window=win,boundless=True),axis=0)>0
-                if len(self.channels)==1: a=np.repeat(a,3,axis=0)
-                a=a.astype(np.float32)/self.scale
-                a[:,~m]=0
-                arrays.append(a)
-                masks.append(m[pad:pad+h,pad:pad+w])
+            result=None
             try:
+                for x,y,w,h in group:
+                    win = Window(x-pad,y-pad,size,size)
+                    a = src.read(self.channels, window=win, boundless=True, fill_value=0)
+                    m = np.min(src.read_masks(self.channels,window=win,boundless=True),axis=0)>0
+                    if len(self.channels)==1: a=np.repeat(a,3,axis=0)
+                    a=a.astype(np.float32)/self.scale
+                    a[:,~m]=0
+                    arrays.append(a)
+                    masks.append(m[pad:pad+h,pad:pad+w])
                 result = self.session.run(None, {'input':np.ascontiguousarray(np.stack(arrays))})[0]
                 if result.shape != (len(group),3,size*4,size*4):
                     raise RuntimeError(f'模型输出形状错误 {result.shape}')
             except Exception as exc:
-                arrays.clear()
+                result=None;arrays.clear();masks.clear()
                 self.fallback(exc)
                 continue
             self.check()
@@ -155,7 +176,7 @@ class Runner:
     def run(self):
         c=self.cfg
         if not math.isfinite(c.resolution) or c.resolution<=0: raise ValueError('目标像元必须为正数（米）')
-        if not (32<=c.minimum_tile<=c.tile<=512 and 1<=c.batch<=8): raise ValueError('分块参数超出安全范围')
+        if not (32<=c.minimum_tile<=c.tile<=512 and 1<=c.batch<=128): raise ValueError('分块参数超出安全范围（batch 1–128）')
         source=Path(c.source).resolve();out=Path(c.output).resolve()
         if source.suffix.lower() not in ('.tif','.tiff'): raise ValueError('仅支持 GeoTIFF')
         out.mkdir(parents=True,exist_ok=True)
@@ -177,15 +198,15 @@ class Runner:
                     if self.scale==65535:self.event('准备',1,'16位输入按 0–65535 归一化，输出为8位显示影像；不进行辐射定量保持')
                     crs,tr,width,height=self.target_grid(src)
                     self.total=src.width*src.height
-                    estimate=self.total*16*4+width*height*4
+                    estimate=self.total*16*4+width*height*4*1.4
                     self.event('准备',3,f'目标 {width:,}×{height:,}，{c.resolution} 米；未压缩暂存上限估计 {estimate/1024**3:.2f} GiB')
                     if shutil.disk_usage(out).free < estimate*1.05+64*1024**2:
                         raise ValueError('输出磁盘可用空间不足以容纳保守估计的临时影像和最终影像')
                     work=Path(tempfile.mkdtemp(prefix='.geosr-task-',dir=out))
                     try:self.session_init()
                     except Exception as exc:
-                        self.device='CPU';self.event('准备',4,f'GPU 初始化失败，使用 CPU：{exc}');self.session_init()
-                    self.event('AI增强',5,f'设备 {self.device}；模型执行一次4倍增强，随后重采样到指定网格')
+                        self.device='CPU';self.batch=1;self.event('准备',4,f'GPU 初始化失败，使用 CPU：{exc}');self.session_init()
+                    self.event('AI增强',5,f'设备 {self.device}；初始 batch={self.batch}，tile={self.tile}；执行一次4倍增强')
                     profile=dict(driver='GTiff',count=4,dtype='uint8',crs=src.crs,
                         transform=src.transform*Affine.scale(.25,.25),width=src.width*4,height=src.height*4,
                         tiled=True,blockxsize=256,blockysize=256,compress='deflate',BIGTIFF='YES',SPARSE_OK=True)
@@ -197,7 +218,7 @@ class Runner:
                         for y in range(0,src.height,c.tile):
                             for x in range(0,src.width,c.tile):
                                 group.append((x,y,min(c.tile,src.width-x),min(c.tile,src.height-y)))
-                                if len(group)>=c.batch:
+                                if len(group)>=self.batch:
                                     self.infer_regions(src,dst,group);group=[]
                         if group:self.infer_regions(src,dst,group)
                 self.session=None;gc.collect()
@@ -209,19 +230,47 @@ class Runner:
                     n=math.ceil(width/256)*math.ceil(height/256)
                     for i,(_,win) in enumerate(dst.block_windows(1),1):
                         self.check();dst.write(vrt.read(window=win),window=win)
-                        self.event('米制网格',70+24*i/n,f'重投影 / 重采样 {i:,}/{n:,}')
+                        self.event('米制网格',70+18*i/n,f'重投影 / 重采样 {i:,}/{n:,}')
                     dst.update_tags(MODEL='Real-ESRGAN realesr-general-x4v3',AI_ENHANCEMENT='Artificial detail, not measured spatial accuracy',
                                     TARGET_PIXEL_METRES=str(c.resolution),SOURCE=source.name,MODEL_PASSES='1',VALIDITY='Alpha band')
+                levels=[2]
+                while max(width,height)/levels[-1]>256:levels.append(levels[-1]*2)
+                self.event('建立金字塔',88,f'生成外部 .tif.ovr，缩小倍数 {levels}')
+                last_progress=[-1]
+                def overview_progress(fraction):
+                    self.check()
+                    value=int(fraction*100)
+                    if value!=last_progress[0]:
+                        last_progress[0]=value
+                        self.event('建立金字塔',88+8*fraction,f'金字塔构建 {value}%')
+                    return True
+                sidecar=build_external(partial,levels,overview_progress)
+                self.check()
                 with rasterio.open(partial) as final:
                     if final.crs!=crs or final.width!=width or final.height!=height or not np.allclose(final.res,(c.resolution,)*2,rtol=0,atol=1e-10):
                         raise RuntimeError('输出地理参考校验失败')
                     for i,(_,win) in enumerate(final.block_windows(1),1):
                         self.check();final.read(window=win)
-                        self.event('校验',94+5*i/n,f'可读性校验 {i:,}/{n:,}')
+                        self.event('校验',96+3*i/n,f'影像与金字塔可读性校验 {i:,}/{n:,}')
+                    for band in range(1,5):
+                        if len(final.overviews(band))!=len(levels):raise RuntimeError('外部金字塔层数校验失败')
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore',rasterio.errors.NotGeoreferencedWarning)
+                        with rasterio.open(sidecar) as ovr:
+                            if ovr.count!=4 or (ovr.width,ovr.height)!=(math.ceil(width/2),math.ceil(height/2)):
+                                raise RuntimeError('外部金字塔尺寸校验失败')
+                            for _,win in ovr.block_windows(1):self.check();ovr.read(window=win)
                 self.check()
                 name=f'{source.stem}_AI_{c.resolution:g}m_{uuid.uuid4().hex[:8]}.tif'
                 target=out/name
-                os.rename(partial,target)  # Windows refuses overwriting an existing file
+                target_ovr=Path(str(target)+'.ovr')
+                os.rename(sidecar,target_ovr)
+                try:
+                    self.check()
+                    os.rename(partial,target)  # Publish TIFF only when its overview is ready.
+                except BaseException:
+                    target_ovr.unlink() # Only this invocation's newly published sidecar.
+                    raise
             shutil.rmtree(work)
             work=None
             self.event('完成',100,str(target))

@@ -1,4 +1,4 @@
-exec((__import__('pathlib').Path(__file__).parent/'acceptance.py').read_text(encoding='utf-8').split("test('实际 DirectML")[0])
+exec((__import__('pathlib').Path(__file__).parent/'acceptance.py').read_text(encoding='utf-8').split("if '--cpu-only' not in sys.argv:")[0])
 def edge():
     # NoData is optional: a valid black pixel must remain opaque.
     a=make('有效黑像元.tif',size=32)
