@@ -67,17 +67,21 @@ jobs:
       - name: Upload verified assets and publish release
         shell: pwsh
         run: |
-          $existing=gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG" 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            if (!(($existing | ConvertFrom-Json).draft)) { throw 'This version is already public' }
+          $releaseList=gh api "repos/$env:GH_REPO/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE) { throw 'Release list query failed' }
+          $existing=$releaseList | Where-Object tag_name -eq $env:RELEASE_TAG
+          if ($existing) {
+            if (!$existing.draft) { throw 'This version is already public' }
           } else {
             gh release create $env:RELEASE_TAG --target $env:GITHUB_SHA --title '遥感影像超分辨率工具 V1.1' --notes-file RELEASE_NOTES.md --draft
             if ($LASTEXITCODE) { throw 'Draft creation failed' }
           }
           gh release upload $env:RELEASE_TAG release/GeoSR-1.1.0-Windows-x64-Setup.exe release/GeoSR-1.1.0-Full-Source.zip release/SHA256SUMS.txt --clobber
           if ($LASTEXITCODE) { throw 'Asset upload failed' }
-          $record=gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          $recordList=gh api "repos/$env:GH_REPO/releases?per_page=100" | ConvertFrom-Json
           if ($LASTEXITCODE) { throw 'Release query failed' }
+          $record=$recordList | Where-Object tag_name -eq $env:RELEASE_TAG
+          if (!$record) { throw 'Draft release missing' }
           foreach ($name in @('GeoSR-1.1.0-Windows-x64-Setup.exe','GeoSR-1.1.0-Full-Source.zip','SHA256SUMS.txt')) {
             $local=Get-Item -LiteralPath (Join-Path release $name)
             $remote=$record.assets | Where-Object name -eq $name
